@@ -1,18 +1,45 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const cron = require('node-cron');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const PayPal = require('paypal-rest-sdk');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// MongoDB Connection
-mongoose.connect('mongodb://localhost:27017/watchearn', {
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/watchearn', {
   useNewUrlParser: true,
   useUnifiedTopology: true
+});
+
+// PayPal configuration
+PayPal.configure({
+  mode: process.env.PAYPAL_MODE || 'sandbox',
+  client_id: process.env.PAYPAL_CLIENT_ID,
+  client_secret: process.env.PAYPAL_CLIENT_SECRET
 });
 
 // User Schema
@@ -20,136 +47,96 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  coins: { type: Number, default: 0 },
-  totalWatchTime: { type: Number, default: 0 }, // in minutes
-  level: { type: Number, default: 1 },
-  referralCode: { type: String, unique: true },
-  referredBy: { type: String, default: null },
-  referralEarnings: { type: Number, default: 0 },
-  premiumUntil: { type: Date, default: null },
-  lastActive: { type: Date, default: Date.now },
+  phone: { type: String },
+  balance: { type: Number, default: 0 },
+  totalEarned: { type: Number, default: 0 },
+  watchTime: { type: Number, default: 0 }, // in seconds
   isActive: { type: Boolean, default: true },
-  deviceInfo: {
-    type: { type: String }, // mobile, tablet, desktop
-    os: String,
-    browser: String,
-    country: String
-  },
-  adPreferences: {
-    categories: [String],
-    blockedCategories: [String]
-  },
-  createdAt: { type: Date, default: Date.now }
+  referralCode: { type: String, unique: true },
+  referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  paymentMethods: [{
+    type: { type: String, enum: ['paypal', 'mpesa'] },
+    details: { type: mongoose.Schema.Types.Mixed }
+  }],
+  createdAt: { type: Date, default: Date.now },
+  lastActive: { type: Date, default: Date.now }
 });
 
-// Content Schema
-const contentSchema = new mongoose.Schema({
+// Video Schema
+const videoSchema = new mongoose.Schema({
   title: { type: String, required: true },
-  description: String,
-  videoUrl: String,
-  thumbnailUrl: String,
-  duration: { type: Number, required: true }, // in minutes
-  category: { type: String, required: true },
-  tags: [String],
-  coinReward: { type: Number, required: true },
-  minWatchTime: { type: Number, default: 0.5 }, // minimum watch time to earn
-  ageRating: { type: String, default: 'G' },
-  language: { type: String, default: 'en' },
-  isActive: { type: Boolean, default: true },
+  description: { type: String },
+  filename: { type: String, required: true },
+  originalName: { type: String, required: true },
+  mimetype: { type: String, required: true },
+  size: { type: Number, required: true },
+  duration: { type: Number }, // in seconds
   views: { type: Number, default: 0 },
   likes: { type: Number, default: 0 },
+  dislikes: { type: Number, default: 0 },
+  category: { type: String, required: true },
+  tags: [String],
+  uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  isActive: { type: Boolean, default: true },
+  monetization: {
+    earningsPerSecond: { type: Number, default: 0.001 }, // Owner earnings per second
+    userEarningsPerSecond: { type: Number, default: 0.0001 } // User earnings per second
+  },
   createdAt: { type: Date, default: Date.now }
 });
 
 // Watch Session Schema
 const watchSessionSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  contentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Content', required: true },
-  startTime: { type: Date, required: true },
-  endTime: Date,
-  watchDuration: { type: Number, default: 0 }, // in minutes
-  coinsEarned: { type: Number, default: 0 },
-  adsShown: { type: Number, default: 0 },
-  adClicks: { type: Number, default: 0 },
-  ownerRevenue: { type: Number, default: 0 }, // your earnings from this session
-  completed: { type: Boolean, default: false },
-  quality: { type: String, default: '720p' },
-  deviceType: String,
-  ipAddress: String,
-  createdAt: { type: Date, default: Date.now }
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  video: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', required: true },
+  startTime: { type: Date, default: Date.now },
+  endTime: { type: Date },
+  duration: { type: Number, default: 0 }, // in seconds
+  userEarnings: { type: Number, default: 0 },
+  ownerEarnings: { type: Number, default: 0 },
+  isActive: { type: Boolean, default: true }
 });
 
-// Ad Schema
-const adSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  description: String,
-  imageUrl: String,
-  videoUrl: String,
-  clickUrl: { type: String, required: true },
-  category: { type: String, required: true },
-  targetAudience: {
-    ageRange: [Number],
-    interests: [String],
-    countries: [String]
-  },
-  budget: { type: Number, required: true },
-  costPerView: { type: Number, required: true },
-  costPerClick: { type: Number, required: true },
-  maxDailyBudget: { type: Number, required: true },
-  isActive: { type: Boolean, default: true },
-  views: { type: Number, default: 0 },
-  clicks: { type: Number, default: 0 },
-  conversions: { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now }
-});
-
-// Revenue Schema (Your earnings tracking)
-const revenueSchema = new mongoose.Schema({
-  date: { type: Date, required: true },
-  adRevenue: { type: Number, default: 0 },
-  premiumRevenue: { type: Number, default: 0 },
-  sponsorshipRevenue: { type: Number, default: 0 },
-  totalActiveUsers: { type: Number, default: 0 },
-  totalWatchTime: { type: Number, default: 0 },
-  totalAdViews: { type: Number, default: 0 },
-  totalAdClicks: { type: Number, default: 0 },
-  averageSessionDuration: { type: Number, default: 0 },
-  retentionRate: { type: Number, default: 0 },
+// Transaction Schema
+const transactionSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['earning', 'withdrawal', 'referral_bonus'], required: true },
+  amount: { type: Number, required: true },
+  description: { type: String },
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  paymentMethod: { type: String, enum: ['paypal', 'mpesa'] },
+  externalTransactionId: { type: String },
   createdAt: { type: Date, default: Date.now }
 });
 
 // Withdrawal Schema
 const withdrawalSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   amount: { type: Number, required: true },
-  method: { type: String, required: true }, // paypal, bank, crypto
-  details: {
-    paypalEmail: String,
-    bankAccount: String,
-    cryptoWallet: String
-  },
-  status: { type: String, default: 'pending' }, // pending, approved, rejected, completed
-  processedAt: Date,
-  createdAt: { type: Date, default: Date.now }
+  method: { type: String, enum: ['paypal', 'mpesa'], required: true },
+  details: { type: mongoose.Schema.Types.Mixed },
+  status: { type: String, enum: ['pending', 'processing', 'completed', 'failed'], default: 'pending' },
+  transactionId: { type: String },
+  createdAt: { type: Date, default: Date.now },
+  processedAt: { type: Date }
 });
 
-// Create Models
+// Models
 const User = mongoose.model('User', userSchema);
-const Content = mongoose.model('Content', contentSchema);
+const Video = mongoose.model('Video', videoSchema);
 const WatchSession = mongoose.model('WatchSession', watchSessionSchema);
-const Ad = mongoose.model('Ad', adSchema);
-const Revenue = mongoose.model('Revenue', revenueSchema);
+const Transaction = mongoose.model('Transaction', transactionSchema);
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
 
-// Middleware for authentication
+// JWT middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
+
   if (!token) {
     return res.status(401).json({ error: 'Access token required' });
   }
-  
+
   jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
@@ -157,19 +144,78 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// Generate referral code
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = 'uploads/videos';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['video/mp4', 'video/avi', 'video/mkv', 'video/mov'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only video files are allowed.'));
+    }
+  }
+});
+
+// Helper function to generate referral code
 const generateReferralCode = () => {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 };
 
-// AUTHENTICATION ENDPOINTS
+// Helper function for M-Pesa payment
+const processMpesaPayment = async (phoneNumber, amount) => {
+  try {
+    const response = await axios.post('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
+      BusinessShortCode: process.env.MPESA_SHORTCODE,
+      Password: process.env.MPESA_PASSWORD,
+      Timestamp: new Date().toISOString().replace(/[-:]/g, '').slice(0, 14),
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: amount,
+      PartyA: phoneNumber,
+      PartyB: process.env.MPESA_SHORTCODE,
+      PhoneNumber: phoneNumber,
+      CallBackURL: process.env.MPESA_CALLBACK_URL,
+      AccountReference: 'WatchEarn',
+      TransactionDesc: 'Payment for WatchEarn'
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.MPESA_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error('M-Pesa payment error:', error);
+    throw error;
+  }
+};
 
-// Register
+// Routes
+
+// User Registration
 app.post('/api/register', async (req, res) => {
   try {
-    const { username, email, password, referralCode } = req.body;
+    const { username, email, password, phone, referralCode } = req.body;
     
-    // Check if user exists
+    // Check if user already exists
     const existingUser = await User.findOne({ 
       $or: [{ email }, { username }] 
     });
@@ -181,41 +227,55 @@ app.post('/api/register', async (req, res) => {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
     
+    // Handle referral
+    let referredBy = null;
+    if (referralCode) {
+      referredBy = await User.findOne({ referralCode });
+    }
+    
     // Create user
     const user = new User({
       username,
       email,
       password: hashedPassword,
+      phone,
       referralCode: generateReferralCode(),
-      referredBy: referralCode || null,
-      coins: referralCode ? 100 : 50 // Bonus for referrals
+      referredBy: referredBy ? referredBy._id : null
     });
     
     await user.save();
     
-    // Reward referrer
-    if (referralCode) {
-      await User.findOneAndUpdate(
-        { referralCode },
-        { $inc: { coins: 50, referralEarnings: 50 } }
-      );
+    // Give referral bonus
+    if (referredBy) {
+      referredBy.balance += 1.0; // $1 referral bonus
+      await referredBy.save();
+      
+      // Record referral transaction
+      const transaction = new Transaction({
+        user: referredBy._id,
+        type: 'referral_bonus',
+        amount: 1.0,
+        description: `Referral bonus for ${username}`,
+        status: 'completed'
+      });
+      await transaction.save();
     }
     
-    // Generate JWT
+    // Generate JWT token
     const token = jwt.sign(
-      { userId: user._id },
+      { userId: user._id, username: user.username },
       process.env.JWT_SECRET || 'your-secret-key',
-      { expiresIn: '30d' }
+      { expiresIn: '7d' }
     );
     
-    res.json({
+    res.status(201).json({
       message: 'User registered successfully',
       token,
       user: {
         id: user._id,
         username: user.username,
         email: user.email,
-        coins: user.coins,
+        balance: user.balance,
         referralCode: user.referralCode
       }
     });
@@ -224,18 +284,20 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// Login
+// User Login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
+    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(400).json({ error: 'Invalid credentials' });
     }
     
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
+    // Check password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
       return res.status(400).json({ error: 'Invalid credentials' });
     }
     
@@ -243,10 +305,11 @@ app.post('/api/login', async (req, res) => {
     user.lastActive = new Date();
     await user.save();
     
+    // Generate JWT token
     const token = jwt.sign(
-      { userId: user._id },
+      { userId: user._id, username: user.username },
       process.env.JWT_SECRET || 'your-secret-key',
-      { expiresIn: '30d' }
+      { expiresIn: '7d' }
     );
     
     res.json({
@@ -256,9 +319,9 @@ app.post('/api/login', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
-        coins: user.coins,
-        level: user.level,
-        totalWatchTime: user.totalWatchTime,
+        balance: user.balance,
+        totalEarned: user.totalEarned,
+        watchTime: user.watchTime,
         referralCode: user.referralCode
       }
     });
@@ -267,17 +330,68 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// CONTENT ENDPOINTS
-
-// Get content feed
-app.get('/api/content', authenticateToken, async (req, res) => {
+// Get User Profile
+app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
-    const { page = 1, limit = 10, category, search } = req.query;
-    const user = await User.findById(req.user.userId);
+    const user = await User.findById(req.user.userId).select('-password');
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Upload Video
+app.post('/api/videos/upload', authenticateToken, upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video file provided' });
+    }
+    
+    const { title, description, category, tags } = req.body;
+    
+    const video = new Video({
+      title,
+      description,
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      category,
+      tags: tags ? tags.split(',').map(tag => tag.trim()) : [],
+      uploadedBy: req.user.userId
+    });
+    
+    await video.save();
+    
+    res.status(201).json({
+      message: 'Video uploaded successfully',
+      video: {
+        id: video._id,
+        title: video.title,
+        filename: video.filename,
+        category: video.category,
+        createdAt: video.createdAt
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get All Videos
+app.get('/api/videos', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const category = req.query.category;
+    const search = req.query.search;
     
     let query = { isActive: true };
     
-    if (category) query.category = category;
+    if (category) {
+      query.category = category;
+    }
+    
     if (search) {
       query.$or = [
         { title: { $regex: search, $options: 'i' } },
@@ -286,23 +400,22 @@ app.get('/api/content', authenticateToken, async (req, res) => {
       ];
     }
     
-    const content = await Content.find(query)
+    const videos = await Video.find(query)
+      .populate('uploadedBy', 'username')
       .sort({ createdAt: -1 })
-      .limit(limit * 1)
       .skip((page - 1) * limit)
-      .select('-__v');
+      .limit(limit);
     
-    // Calculate personalized coin rewards based on user level
-    const personalizedContent = content.map(item => ({
-      ...item.toObject(),
-      coinReward: Math.floor(item.coinReward * (1 + (user.level - 1) * 0.1))
-    }));
+    const totalVideos = await Video.countDocuments(query);
     
     res.json({
-      content: personalizedContent,
+      videos,
       pagination: {
         currentPage: page,
-        totalPages: Math.ceil(await Content.countDocuments(query) / limit)
+        totalPages: Math.ceil(totalVideos / limit),
+        totalVideos,
+        hasNext: page < Math.ceil(totalVideos / limit),
+        hasPrev: page > 1
       }
     });
   } catch (error) {
@@ -310,115 +423,147 @@ app.get('/api/content', authenticateToken, async (req, res) => {
   }
 });
 
-// Get content by ID
-app.get('/api/content/:id', authenticateToken, async (req, res) => {
+// Stream Video
+app.get('/api/videos/:id/stream', async (req, res) => {
   try {
-    const content = await Content.findById(req.params.id);
-    if (!content) {
-      return res.status(404).json({ error: 'Content not found' });
+    const video = await Video.findById(req.params.id);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+    
+    const videoPath = path.join(__dirname, 'uploads', 'videos', video.filename);
+    
+    if (!fs.existsSync(videoPath)) {
+      return res.status(404).json({ error: 'Video file not found' });
+    }
+    
+    const stat = fs.statSync(videoPath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+    
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = (end - start) + 1;
+      const file = fs.createReadStream(videoPath, { start, end });
+      const head = {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': 'video/mp4',
+      };
+      res.writeHead(206, head);
+      file.pipe(res);
+    } else {
+      const head = {
+        'Content-Length': fileSize,
+        'Content-Type': 'video/mp4',
+      };
+      res.writeHead(200, head);
+      fs.createReadStream(videoPath).pipe(res);
     }
     
     // Increment views
-    content.views += 1;
-    await content.save();
-    
-    res.json(content);
+    video.views += 1;
+    await video.save();
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// WATCH SESSION ENDPOINTS
-
-// Start watch session
+// Start Watch Session
 app.post('/api/watch/start', authenticateToken, async (req, res) => {
   try {
-    const { contentId, deviceType, quality } = req.body;
+    const { videoId } = req.body;
     
-    const content = await Content.findById(contentId);
-    if (!content) {
-      return res.status(404).json({ error: 'Content not found' });
+    const video = await Video.findById(videoId);
+    if (!video) {
+      return res.status(404).json({ error: 'Video not found' });
     }
     
-    const session = new WatchSession({
-      userId: req.user.userId,
-      contentId,
-      startTime: new Date(),
-      deviceType,
-      quality: quality || '720p',
-      ipAddress: req.ip
+    // Check if user has an active session for this video
+    const existingSession = await WatchSession.findOne({
+      user: req.user.userId,
+      video: videoId,
+      isActive: true
     });
     
-    await session.save();
+    if (existingSession) {
+      return res.json({ sessionId: existingSession._id });
+    }
     
-    res.json({
-      message: 'Watch session started',
-      sessionId: session._id,
-      content: {
-        title: content.title,
-        duration: content.duration,
-        coinReward: content.coinReward
-      }
+    // Create new watch session
+    const watchSession = new WatchSession({
+      user: req.user.userId,
+      video: videoId
     });
+    
+    await watchSession.save();
+    
+    res.json({ sessionId: watchSession._id });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Update watch session (called every minute)
+// Update Watch Session (called every second)
 app.post('/api/watch/update', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, watchDuration, adsShown, adClicks } = req.body;
+    const { sessionId, secondsWatched } = req.body;
     
-    const session = await WatchSession.findById(sessionId);
-    if (!session) {
+    const session = await WatchSession.findById(sessionId)
+      .populate('video')
+      .populate('user');
+    
+    if (!session || !session.isActive) {
       return res.status(404).json({ error: 'Session not found' });
     }
     
-    if (session.userId.toString() !== req.user.userId) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    // Update session
-    session.watchDuration = watchDuration;
-    session.adsShown = adsShown || 0;
-    session.adClicks = adClicks || 0;
+    // Update session duration
+    session.duration = secondsWatched;
     
     // Calculate earnings
-    const content = await Content.findById(session.contentId);
-    const baseCoinsPerMinute = content.coinReward / content.duration;
-    const coinsEarned = Math.floor(watchDuration * baseCoinsPerMinute);
+    const userEarningsPerSecond = session.video.monetization.userEarningsPerSecond;
+    const ownerEarningsPerSecond = session.video.monetization.earningsPerSecond;
     
-    session.coinsEarned = coinsEarned;
+    const newUserEarnings = userEarningsPerSecond;
+    const newOwnerEarnings = ownerEarningsPerSecond;
     
-    // Calculate your revenue (owner earnings)
-    const adRevenue = (adsShown * 0.02) + (adClicks * 0.1); // $0.02 per ad view, $0.10 per click
-    const engagementRevenue = watchDuration * 0.001; // $0.001 per minute watched
-    session.ownerRevenue = adRevenue + engagementRevenue;
+    session.userEarnings += newUserEarnings;
+    session.ownerEarnings += newOwnerEarnings;
     
     await session.save();
     
-    // Update user stats
-    await User.findByIdAndUpdate(req.user.userId, {
-      $inc: {
-        coins: coinsEarned,
-        totalWatchTime: watchDuration
-      },
-      lastActive: new Date()
+    // Update user balance and stats
+    const user = await User.findById(req.user.userId);
+    user.balance += newUserEarnings;
+    user.totalEarned += newUserEarnings;
+    user.watchTime += 1;
+    user.lastActive = new Date();
+    await user.save();
+    
+    // Create earning transaction
+    const transaction = new Transaction({
+      user: req.user.userId,
+      type: 'earning',
+      amount: newUserEarnings,
+      description: `Watched ${session.video.title}`,
+      status: 'completed'
     });
+    await transaction.save();
     
     res.json({
-      message: 'Session updated',
-      coinsEarned,
-      totalWatchTime: watchDuration,
-      ownerRevenue: session.ownerRevenue
+      userEarnings: newUserEarnings,
+      totalEarnings: session.userEarnings,
+      balance: user.balance
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// End watch session
+// End Watch Session
 app.post('/api/watch/end', authenticateToken, async (req, res) => {
   try {
     const { sessionId } = req.body;
@@ -428,115 +573,37 @@ app.post('/api/watch/end', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
     
+    session.isActive = false;
     session.endTime = new Date();
-    session.completed = true;
     await session.save();
     
-    // Level up logic
-    const user = await User.findById(req.user.userId);
-    const newLevel = Math.floor(user.totalWatchTime / 60) + 1; // Level up every hour
-    
-    if (newLevel > user.level) {
-      user.level = newLevel;
-      user.coins += newLevel * 10; // Bonus coins for leveling up
-      await user.save();
-    }
-    
-    res.json({
-      message: 'Session ended',
-      totalCoinsEarned: session.coinsEarned,
-      newLevel: user.level,
-      levelUpBonus: newLevel > user.level ? newLevel * 10 : 0
-    });
+    res.json({ message: 'Session ended successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// AD ENDPOINTS
-
-// Serve ads
-app.get('/api/ads', authenticateToken, async (req, res) => {
+// Get User Transactions
+app.get('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const { category, count = 1 } = req.query;
-    const user = await User.findById(req.user.userId);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
     
-    let query = { isActive: true, budget: { $gt: 0 } };
+    const transactions = await Transaction.find({ user: req.user.userId })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
     
-    if (category) query.category = category;
-    
-    // Personalized ads based on user preferences
-    if (user.adPreferences && user.adPreferences.categories.length > 0) {
-      query.category = { $in: user.adPreferences.categories };
-    }
-    
-    const ads = await Ad.find(query)
-      .sort({ costPerView: -1 }) // Prioritize higher paying ads
-      .limit(parseInt(count));
-    
-    res.json({ ads });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Track ad interaction
-app.post('/api/ads/interact', authenticateToken, async (req, res) => {
-  try {
-    const { adId, type, sessionId } = req.body; // type: 'view' or 'click'
-    
-    const ad = await Ad.findById(adId);
-    if (!ad) {
-      return res.status(404).json({ error: 'Ad not found' });
-    }
-    
-    if (type === 'view') {
-      ad.views += 1;
-      ad.budget -= ad.costPerView;
-      
-      // Reward user with coins
-      await User.findByIdAndUpdate(req.user.userId, {
-        $inc: { coins: 2 }
-      });
-    } else if (type === 'click') {
-      ad.clicks += 1;
-      ad.budget -= ad.costPerClick;
-      
-      // Reward user with more coins
-      await User.findByIdAndUpdate(req.user.userId, {
-        $inc: { coins: 5 }
-      });
-    }
-    
-    await ad.save();
+    const totalTransactions = await Transaction.countDocuments({ user: req.user.userId });
     
     res.json({
-      message: 'Ad interaction tracked',
-      coinsEarned: type === 'view' ? 2 : 5
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// USER ENDPOINTS
-
-// Get user profile
-app.get('/api/user/profile', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId).select('-password');
-    const totalSessions = await WatchSession.countDocuments({ userId: req.user.userId });
-    const totalEarnings = await WatchSession.aggregate([
-      { $match: { userId: mongoose.Types.ObjectId(req.user.userId) } },
-      { $group: { _id: null, total: { $sum: '$coinsEarned' } } }
-    ]);
-    
-    res.json({
-      user,
-      stats: {
-        totalSessions,
-        totalEarnings: totalEarnings[0]?.total || 0,
-        averageSessionDuration: user.totalWatchTime / totalSessions || 0
+      transactions,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(totalTransactions / limit),
+        totalTransactions,
+        hasNext: page < Math.ceil(totalTransactions / limit),
+        hasPrev: page > 1
       }
     });
   } catch (error) {
@@ -544,224 +611,191 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Update user preferences
-app.put('/api/user/preferences', authenticateToken, async (req, res) => {
-  try {
-    const { adPreferences, deviceInfo } = req.body;
-    
-    const user = await User.findByIdAndUpdate(
-      req.user.userId,
-      { adPreferences, deviceInfo },
-      { new: true }
-    ).select('-password');
-    
-    res.json({ message: 'Preferences updated', user });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// WITHDRAWAL ENDPOINTS
-
-// Request withdrawal
-app.post('/api/withdrawal/request', authenticateToken, async (req, res) => {
+// Request Withdrawal
+app.post('/api/withdraw', authenticateToken, async (req, res) => {
   try {
     const { amount, method, details } = req.body;
     
     const user = await User.findById(req.user.userId);
-    if (user.coins < amount) {
-      return res.status(400).json({ error: 'Insufficient coins' });
+    
+    if (amount > user.balance) {
+      return res.status(400).json({ error: 'Insufficient balance' });
     }
     
-    if (amount < 1000) {
-      return res.status(400).json({ error: 'Minimum withdrawal is 1000 coins' });
+    if (amount < 5) {
+      return res.status(400).json({ error: 'Minimum withdrawal amount is $5' });
     }
     
+    // Create withdrawal request
     const withdrawal = new Withdrawal({
-      userId: req.user.userId,
+      user: req.user.userId,
       amount,
       method,
-      details
+      details,
+      transactionId: uuidv4()
     });
     
     await withdrawal.save();
     
-    // Deduct coins from user
-    user.coins -= amount;
+    // Deduct from user balance
+    user.balance -= amount;
     await user.save();
+    
+    // Create transaction record
+    const transaction = new Transaction({
+      user: req.user.userId,
+      type: 'withdrawal',
+      amount: -amount,
+      description: `Withdrawal via ${method}`,
+      status: 'pending',
+      paymentMethod: method
+    });
+    await transaction.save();
     
     res.json({
       message: 'Withdrawal request submitted',
       withdrawalId: withdrawal._id,
-      remainingCoins: user.coins
+      transactionId: withdrawal.transactionId
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ADMIN ENDPOINTS (Owner/Admin only)
-
-// Get revenue dashboard
-app.get('/api/admin/revenue', async (req, res) => {
+// Process PayPal Withdrawal
+app.post('/api/withdraw/paypal/process', authenticateToken, async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
+    const { withdrawalId } = req.body;
     
-    const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) dateFilter.$lte = new Date(endDate);
+    const withdrawal = await Withdrawal.findById(withdrawalId);
+    if (!withdrawal) {
+      return res.status(404).json({ error: 'Withdrawal not found' });
+    }
     
-    const pipeline = [
-      { $match: dateFilter.createdAt ? { createdAt: dateFilter } : {} },
-      {
-        $group: {
-          _id: null,
-          totalRevenue: { $sum: '$ownerRevenue' },
-          totalSessions: { $sum: 1 },
-          totalWatchTime: { $sum: '$watchDuration' },
-          totalAdViews: { $sum: '$adsShown' },
-          totalAdClicks: { $sum: '$adClicks' }
-        }
-      }
-    ];
-    
-    const revenueData = await WatchSession.aggregate(pipeline);
-    const activeUsers = await User.countDocuments({ 
-      lastActive: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-    });
-    
-    res.json({
-      revenue: revenueData[0] || {
-        totalRevenue: 0,
-        totalSessions: 0,
-        totalWatchTime: 0,
-        totalAdViews: 0,
-        totalAdClicks: 0
+    const payoutData = {
+      sender_batch_header: {
+        sender_batch_id: withdrawal.transactionId,
+        email_subject: 'You have a payment'
       },
-      activeUsers,
-      revenuePerMinute: revenueData[0]?.totalRevenue / revenueData[0]?.totalWatchTime || 0,
-      averageSessionDuration: revenueData[0]?.totalWatchTime / revenueData[0]?.totalSessions || 0
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add content (admin)
-app.post('/api/admin/content', async (req, res) => {
-  try {
-    const content = new Content(req.body);
-    await content.save();
-    res.json({ message: 'Content added successfully', content });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add advertisement (admin)
-app.post('/api/admin/ads', async (req, res) => {
-  try {
-    const ad = new Ad(req.body);
-    await ad.save();
-    res.json({ message: 'Ad added successfully', ad });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Daily revenue tracking (automated)
-cron.schedule('0 0 * * *', async () => {
-  try {
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const startOfDay = new Date(yesterday.setHours(0, 0, 0, 0));
-    const endOfDay = new Date(yesterday.setHours(23, 59, 59, 999));
-    
-    const dailyStats = await WatchSession.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: startOfDay, $lte: endOfDay }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalRevenue: { $sum: '$ownerRevenue' },
-          totalWatchTime: { $sum: '$watchDuration' },
-          totalAdViews: { $sum: '$adsShown' },
-          totalAdClicks: { $sum: '$adClicks' },
-          sessionCount: { $sum: 1 }
-        }
-      }
-    ]);
-    
-    const activeUsers = await User.countDocuments({
-      lastActive: { $gte: startOfDay, $lte: endOfDay }
-    });
-    
-    const stats = dailyStats[0] || {
-      totalRevenue: 0,
-      totalWatchTime: 0,
-      totalAdViews: 0,
-      totalAdClicks: 0,
-      sessionCount: 0
+      items: [{
+        recipient_type: 'EMAIL',
+        amount: {
+          value: withdrawal.amount.toString(),
+          currency: 'USD'
+        },
+        receiver: withdrawal.details.email,
+        note: 'Payment from WatchEarn App',
+        sender_item_id: withdrawal._id.toString()
+      }]
     };
     
-    const revenue = new Revenue({
-      date: startOfDay,
-      adRevenue: stats.totalRevenue,
-      totalActiveUsers: activeUsers,
-      totalWatchTime: stats.totalWatchTime,
-      totalAdViews: stats.totalAdViews,
-      totalAdClicks: stats.totalAdClicks,
-      averageSessionDuration: stats.totalWatchTime / stats.sessionCount || 0
+    PayPal.payout.create(payoutData, (error, payout) => {
+      if (error) {
+        console.error('PayPal payout error:', error);
+        withdrawal.status = 'failed';
+        withdrawal.save();
+        return res.status(500).json({ error: 'PayPal payout failed' });
+      }
+      
+      withdrawal.status = 'completed';
+      withdrawal.processedAt = new Date();
+      withdrawal.save();
+      
+      res.json({ message: 'PayPal withdrawal processed successfully' });
     });
-    
-    await revenue.save();
-    console.log('Daily revenue tracking completed');
-  } catch (error) {
-    console.error('Daily revenue tracking error:', error);
-  }
-});
-
-// Real-time user activity tracking
-app.post('/api/user/ping', authenticateToken, async (req, res) => {
-  try {
-    await User.findByIdAndUpdate(req.user.userId, {
-      lastActive: new Date()
-    });
-    res.json({ message: 'Activity tracked' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get leaderboard
-app.get('/api/leaderboard', authenticateToken, async (req, res) => {
+// Get Dashboard Stats (Owner)
+app.get('/api/admin/stats', authenticateToken, async (req, res) => {
   try {
-    const topUsers = await User.find()
-      .sort({ totalWatchTime: -1 })
+    const totalUsers = await User.countDocuments();
+    const totalVideos = await Video.countDocuments();
+    const totalWatchTime = await WatchSession.aggregate([
+      { $group: { _id: null, totalTime: { $sum: '$duration' } } }
+    ]);
+    
+    const totalEarnings = await WatchSession.aggregate([
+      { $group: { _id: null, totalOwnerEarnings: { $sum: '$ownerEarnings' } } }
+    ]);
+    
+    const dailyEarnings = await WatchSession.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+        }
+      },
+      { $group: { _id: null, dailyEarnings: { $sum: '$ownerEarnings' } } }
+    ]);
+    
+    res.json({
+      totalUsers,
+      totalVideos,
+      totalWatchTime: totalWatchTime[0]?.totalTime || 0,
+      totalEarnings: totalEarnings[0]?.totalOwnerEarnings || 0,
+      dailyEarnings: dailyEarnings[0]?.dailyEarnings || 0
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Top Videos
+app.get('/api/videos/top', async (req, res) => {
+  try {
+    const topVideos = await Video.find({ isActive: true })
+      .sort({ views: -1 })
       .limit(10)
-      .select('username totalWatchTime level coins');
+      .populate('uploadedBy', 'username');
     
-    res.json({ leaderboard: topUsers });
+    res.json(topVideos);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Real-time earnings calculation (runs every second)
+cron.schedule('* * * * * *', async () => {
+  try {
+    const activeSessions = await WatchSession.find({ isActive: true })
+      .populate('video')
+      .populate('user');
+    
+    for (const session of activeSessions) {
+      // Check if session is still active (user hasn't been inactive for too long)
+      const lastUpdate = new Date(session.user.lastActive);
+      const now = new Date();
+      const timeDiff = (now - lastUpdate) / 1000; // seconds
+      
+      if (timeDiff > 30) { // If user inactive for more than 30 seconds, end session
+        session.isActive = false;
+        session.endTime = new Date();
+        await session.save();
+      }
+    }
+  } catch (error) {
+    console.error('Cron job error:', error);
   }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  console.error(error.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large' });
+    }
+  }
+  
+  console.error('Error:', error);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-const PORT = process.env.PORT || 3000;
+// Start server
 app.listen(PORT, () => {
-  console.log(`Watch & Earn Backend running on port ${PORT}`);
-  console.log('Revenue streams active:');
-  console.log('- Ad revenue: $0.02 per view, $0.10 per click');
-  console.log('- Engagement revenue: $0.001 per minute watched');
-  console.log('- User activity tracking enabled');
+  console.log(`Server running on port ${PORT}`);
+  console.log('Watch & Earn Backend API is ready!');
 });
 
 module.exports = app;
